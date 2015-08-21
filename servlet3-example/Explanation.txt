@@ -1,0 +1,324 @@
+EE Servlet 3: Developing User Login with Session and Filter
+
+I have introduced the Application class in my previous post where you can setup backend services. One example service I added is the UserService. This service will load a Java users properties file that contains username and password sets; and it’s used later to authenticate users to login into the web application. Now I will show how the login part is done using standard Servlet API along with this backend service.
+At a high level, what we want is to restrict some web resources (this means certain URLs provided by Servlets such as “/sysprops”, or “/user”) to only client users who are known in our users properties file. Users may identify themself with the matching password. This is typically done with a user login form, authenticate it, then insert a login token into Http Session scope space. This login token then can be used to verify whether to allow users to access the restricted resources or not. We only interested in a single authorization (no roles are defined, and any logged in user may access any protected URLs.)
+You have already seen an example that mapped to “/sysprops” URL in one of my previous post provided by the SysPropsServlet, which it simply generate a HTML table of System information. These are sensitive information, so we want to protect this URL. We would need to create a class that implements javax.servlet.Filter interface, and then add the “/sysprops” URL with this filter so it can pre-process the request before the actual Servlet does. This filter gives us a place to inspect the HTTP request object and abort the request if needed to, thus restricting the access.
+01
+package zemian.servlet3example.web;
+02
+ 
+03
+import java.io.IOException;
+04
+import javax.servlet.Filter;
+05
+import javax.servlet.FilterChain;
+06
+import javax.servlet.FilterConfig;
+07
+import javax.servlet.ServletException;
+08
+import javax.servlet.ServletRequest;
+09
+import javax.servlet.ServletResponse;
+10
+import javax.servlet.annotation.WebFilter;
+11
+import javax.servlet.http.HttpServletRequest;
+12
+import zemian.service.logging.Logger;
+13
+ 
+14
+@WebFilter(urlPatterns={"/sys-props", "/user"})
+15
+public class LoginRequiredFilter implements Filter {
+16
+    private static final Logger LOGGER = new Logger(LoginRequiredFilter.class);
+17
+    public static final String LOGIN_REDIRECT = "LOGIN_REDIRECT";
+18
+   
+19
+    @Override
+20
+    public void init(FilterConfig filterConfig) throws ServletException {
+21
+    }
+22
+ 
+23
+    @Override
+24
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
+25
+        if (request instanceof HttpServletRequest) {
+26
+            HttpServletRequest req = (HttpServletRequest) request;
+27
+            LOGGER.trace("Checking LoginSession token for uri=%s", req.getRequestURI());
+28
+            LoginSession loginSession = LoginServlet.getOptionalLoginSession(req);
+29
+            if (loginSession == null) {
+30
+                LOGGER.debug("No LoginSession token found; forwarding request to login page.");
+31
+                // We need to save the old URI so we can auto redirect after login.
+32
+                req.setAttribute(LOGIN_REDIRECT, req.getRequestURI());
+33
+                req.getRequestDispatcher("/login").forward(request, response);
+34
+                return;
+35
+            } else {
+36
+                LOGGER.debug("Request allowed using LoginSession token=%s", loginSession.getId());
+37
+            }
+38
+        }
+39
+        chain.doFilter(request, response);
+40
+    }
+41
+ 
+42
+    @Override
+43
+    public void destroy() {
+44
+    }
+45
+ 
+46
+}
+Notice that you can configure this filter to match more than one URL that you want to protect. You can even use wildcard pattern such as “/*” and it will protect every URLs in your application! The filter simply looks into the Http Session space for a LoginSession object that we will create later. If it’s found then it let the request through, otherwise it will redirect to a Login form page, which is served by LoginServlet class (notice the RETURN statement for early exit of the filter method without calling the filter chain!).
+The LoginServlet class is a form processing Servlet that will prompt user for username and password. If it succeed, then we will insert the LoginSession token object into the HttpSession space space, which is what the filter above is looking for. Here is the processing Servlet code.
+001
+package zemian.servlet3example.web;
+002
+ 
+003
+import java.io.IOException;
+004
+import javax.servlet.ServletException;
+005
+import javax.servlet.annotation.WebServlet;
+006
+import javax.servlet.http.HttpServletRequest;
+007
+import javax.servlet.http.HttpServletResponse;
+008
+import javax.servlet.http.HttpSession;
+009
+import zemian.service.logging.Logger;
+010
+import zemian.servlet3example.service.Application;
+011
+import zemian.servlet3example.service.UserService;
+012
+ 
+013
+@WebServlet("/login")
+014
+public class LoginServlet  extends HtmlWriterServlet {
+015
+    private static final Logger LOGGER = new Logger(LoginServlet.class);
+016
+    
+017
+    @Override
+018
+    protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+019
+        HtmlWriter html = createHtmlWriter(req, resp);
+020
+        String message;
+021
+        
+022
+        // Check to see if we are doing logout or not.
+023
+        LoginSession loginSession = getOptionalLoginSession(req);
+024
+        if (loginSession != null && req.getParameter("logout") != null) {
+025
+            logout(req);
+026
+            message = "Your have successfully logged out.";
+027
+        } else {  
+028
+            message = (String)req.getAttribute("message");
+029
+            if (message == null)
+030
+                message = "";
+031
+        } 
+032
+        
+033
+        // Show a login form
+034
+        String redirectUri = (String)req.getAttribute(LoginRequiredFilter.LOGIN_REDIRECT);
+035
+        String redirectHtmlTag = "";
+036
+        if (redirectUri != null) {
+037
+            redirectHtmlTag = "<input type='hidden' name='redirectUri' value='" + redirectUri + "'/>";
+038
+        }
+039
+        html.header()
+040
+            .h(1, "Please Login")
+041
+            .p(message)
+042
+            .println("<form method='post' action='login'>")
+043
+            .println(redirectHtmlTag)
+044
+            .println("<p/>Username: <input type='text' name='username'/>")
+045
+            .println("<p/>Password: <input type='password' name='password'/>")
+046
+            .println("<p/><input type='submit' value='Submit'/>")
+047
+            .println("</form>")
+048
+            .footer();
+049
+    }
+050
+ 
+051
+    @Override
+052
+    protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+053
+        LOGGER.debug("Processing login form.");
+054
+        if (login(req)) {
+055
+            // Login succeed, we should auto redirect user if exists.
+056
+            String redirectUri = req.getParameter("redirectUri");
+057
+            if (redirectUri != null) {
+058
+                LOGGER.debug("Redirect after login to: %s", redirectUri);
+059
+                resp.sendRedirect(redirectUri);
+060
+                return;
+061
+            }
+062
+        }
+063
+        
+064
+        // Show the form again in case login failed or user didn't provide a redirect
+065
+        doGet(req, resp);
+066
+    }  
+067
+       
+068
+    protected LoginSession createLoginSession(HttpServletRequest req, String username) {
+069
+        LoginSession result = new LoginSession(username);
+070
+        req.getSession(true).setAttribute(LoginSession.LOGIN_SESSION_KEY, result);
+071
+        return result;
+072
+    }
+073
+    
+074
+    protected void removeLoginSession(HttpServletRequest req) {
+075
+        HttpSession session = req.getSession(false);
+076
+        if (session != null) {
+077
+            session.removeAttribute(LoginSession.LOGIN_SESSION_KEY);
+078
+        }
+079
+    }
+080
+ 
+081
+    private boolean login(HttpServletRequest req) throws IOException {
+082
+        String username = req.getParameter("username");
+083
+        String password = req.getParameter("password");
+084
+        
+085
+        UserService userService = Application.getInstance().getUserService();
+086
+        if (userService.validate(username, password)) {
+087
+            LOGGER.info("User %s logged in successfully.", username);
+088
+            // Create Session Data here after successful authenticated.
+089
+            LoginSession loginsession = getOptionalLoginSession(req);
+090
+            if (loginsession == null) {
+091
+                createLoginSession(req, username);
+092
+                req.setAttribute("message", "You have successfully logged in.");
+093
+            } else {
+094
+                req.setAttribute("message", "You already have logged in.");           
+095
+            }
+096
+        } else {
+097
+            LOGGER.info("User %s failed to login.", username);
+098
+            req.setAttribute("message", "Invalid login.");
+099
+        }
+100
+        return true;
+101
+    }
+102
+    
+103
+    /** Return LoginSession if found in HttpSession scope, else return NULL value. */
+104
+    public static LoginSession getOptionalLoginSession(HttpServletRequest req) {
+105
+        LoginSession result = null;
+106
+        HttpSession session = req.getSession(false);
+107
+        if (session != null)
+108
+            result = (LoginSession)session.getAttribute(LoginSession.LOGIN_SESSION_KEY);
+109
+        return result;
+110
+    }
+111
+}
+Inside LoginServlet class is where we use the UserService service to validate username and password. We display the login form with a GET request, and then process the login with a POST action. Once username and password are checked, we create the LoginSession object. This is just a simple POJO to represent a session token; and you can hold any user information you want. I won’t list here, but you can browse it on GitHub. Note that you should make it serializable though, because any data stored in HttpSession may be subject to be serialize/deserialize by your application server.
+Notice also that I have implemented the Logout functionality into the LoginServlet class as well. You simply pass “logout” query parameter, and it will be detected and remove the login token from the session. Ensure you invalid the HttpSession itself when you do this, just to be in clean side. I also exposed a static helper getOptionalLoginSession that is used between few of the classes to check whether user has logged in or not.
+These few classes are simple but yet demonstrated the use of Servlet Filter and Servlet on how to manage Session data. This programming pattern allows users to have their own browsing session and privacy through the application.
